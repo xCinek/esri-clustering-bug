@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="initial-scale=1,maximum-scale=1,user-scalable=no"
+    />
+    <title>Renderer crash</title>
+    <style>
+      html,
+      body,
+      #viewDiv {
+        padding: 0;
+        margin: 0;
+        height: 100%;
+        width: 100%;
+      }
+    </style>
+
+    <link
+      rel="stylesheet"
+      href="https://js.arcgis.com/4.15/esri/themes/light/main.css"
+    />
+    <script src="https://js.arcgis.com/4.22/"></script>
+
+    <script>
+      require([
+        "esri/Map",
+        "esri/views/MapView",
+        "esri/layers/FeatureLayer",
+        "esri/core/promiseUtils",
+        "esri/Graphic",
+        "esri/geometry/Extent",
+        "esri/geometry/Point",
+        "esri/tasks/Locator"
+      ], function(
+        Map,
+        MapView,
+        FeatureLayer,
+        promiseUtils,
+        Graphic,
+        Extent,
+        Point,
+        Locator
+      ) {
+        let symbolsLoaded = 1;
+        let imageMax = 100;
+        let refreshInterval = 1000;
+
+        let seconds = 10;
+        let intervalID = setInterval(function () {
+            document.getElementById("myText").innerHTML = `Wait for update markers positions: ${seconds} s.`;
+            if (--seconds === 0) {
+                document.getElementById("myText").innerHTML = `Markers positions are incorrect. Need to zoom in and out to fix it.`;
+                window.clearInterval(intervalID);
+            }
+        }, 1000);
+
+        // THE MOST IMPORTANT PART FOR REPRODUCTION 
+        // getting features from clustered layer and updating their positions
+        setTimeout(async () => {
+          const ourLayer = view.map.findLayerById("OurLayer");
+          const features = (await ourLayer.queryFeatures()).features;
+          for (let i = 0; i < features.length; i++) {
+            const lat = random(34.9 - 0.3, 34.9 + 0.3, 0.001);
+            const long = random(-119.98 - 0.5, -119.98 + 0.5, 0.001);
+            features[i].geometry.latitude = lat;
+            features[i].geometry.longitude = long;
+           }
+          
+          ourLayer.applyEdits({
+            addFeatures: [],
+            updateFeatures: [...features],
+            deleteFeatures: []
+          });
+        }, 10000);
+        
+        const view = new MapView({
+          map: new Map({
+            basemap: "streets-navigation-vector"
+          }),
+          container: "viewDiv",
+          extent: {
+            spatialReference: {
+              wkid: 102100
+            },
+            xmin: -13398954,
+            ymin: 4157304,
+            xmax: -13306084,
+            ymax: 4160211,
+          },
+          popup: {
+            dockEnabled: true,
+            dockOptions: {
+              position: "top-right",
+              breakpoint: false
+            }
+          }
+        });
+
+        view
+        .when()
+        .then(createClientSideGraphics)
+        .then(getFeaturesFromPromises)
+        .then(createOurLayer)
+        .then(addToView)
+        .catch(function(e) {
+          console.error("Creating FeatureLayer from photos failed", e);
+        });
+              
+        function random(min, max) {
+            const result = Math.floor((Math.random() * (max - min + 0.001)) / 0.001);
+            return result * 0.001 + min;
+        }
+
+        let updateRenderer = function() {
+          const ourLayer = view.map.findLayerById("OurLayer");
+          
+          if (ourLayer === undefined || ourLayer === null) return;
+          
+          ourLayer.featureReduction = {
+            type: "cluster",
+            clusterRadius: "120px",
+            clusterMaxSize: "32px",
+            clusterMinSize: "32px",
+            labelingInfo: [{
+            labelExpressionInfo: {
+              expression: "$feature.cluster_count"
+            },
+            deconflictionStrategy: "none",
+            labelPlacement: "below-center",
+            symbol: {
+              type: "text",
+              color: "white",
+              font: {
+              size: "12px"
+              },
+              haloSize: 1,
+              haloColor: "black"
+            }
+            }]
+          };
+          const r = ourLayer.renderer.clone();
+          r.uniqueValueInfos = generateUVInfos(0, 100);
+          ourLayer.renderer = r;
+        };
+
+        let b = setInterval(updateRenderer, refreshInterval);
+
+        function generateUVInfos(fromIndex, uptoIndex) {
+          const ans=[]
+          for(let i = fromIndex; i <= uptoIndex; i++) {
+            const uvInfo = {
+              value: i.toString(),
+              symbol: 
+              {
+                type: "picture-marker",
+                url: getIconUrl(),
+                height: "24",
+                width: "24",
+                yoffset: "0"
+              }
+            }
+            ans.push(uvInfo);
+          }
+          
+          return ans;
+        }
+
+        // Creates a client-side FeatureLayer from an array of graphics
+        function createLayer(graphics, name, color) {
+          return new FeatureLayer({
+            id: name,
+            name: name,
+            source: graphics,
+            objectIdField: "OBJECTID",
+            fields: [
+              {
+                name: "OBJECTID",
+                type: "oid"
+              },
+              {
+                name: "PIC_ID",
+                type: "string"
+              },
+              {
+                name: "url",
+                type: "string"
+              }
+            ],
+            popupTemplate: {
+              title: 'Just a title',
+              content: "<img src='{url}'>"
+            },
+            renderer: {
+              type: "unique-value",
+              field: "PIC_ID",
+              defaultSymbol: {
+                type: 'simple-marker',
+                style: 'circle',
+                size: 12,
+                color: color
+              },
+              uniqueValueInfos: generateUVInfos(1,1)
+            }
+          })
+        }
+        
+        function createOurLayer(graphics) {
+          return createLayer(graphics, 'OurLayer', 'red');
+        }
+        
+        function addToView(layer) {
+          view.map.add(layer);
+        }
+
+        // Filters only promises that resolve with valid values (a graphic
+        // in this case) and resolves them as an array of graphics.
+        // In other words, each attempt at fetching an image returns a promise.
+        // Images that fail to fetch will be filtered out of the response array
+        // so the images that successfully load can be added to the layer.
+        function getFeaturesFromPromises(eachAlwaysResponses) {
+            return eachAlwaysResponses
+              .filter(function(graphicPromise) {
+                return graphicPromise.value;
+              })
+              .map(function(graphicPromise) {
+                return graphicPromise.value;
+              });
+        }
+        
+        function getIconUrl() {
+            return `https://simpleicons.org/icons/adobeaftereffects.svg`
+        } 
+
+        function createGraphics(url, id, j) {
+          return promiseUtils.create(function(resolve, reject) {
+            const lat = random(34.9 - 0.3, 34.9 + 0.3, 0.001);
+            const long = random(-119.98 - 0.5, -119.98 + 0.5, 0.001);
+
+            const image = document.createElement("img");
+            image.src = url;
+            image.onload = function() {
+              image.load = image.onerror = null;
+              const location = new Point({
+                  latitude: lat, 
+                  longitude: long 
+                });
+
+              resolve(
+                new Graphic({
+                  geometry: location,
+                  attributes: {
+                    url: url,
+                    OBJECTID: url+'__'+j.toString(),
+                    PIC_ID: id.toString()
+                  }
+                })
+              );
+            };
+
+            image.onerror = function() {
+              image.load = image.onerror = null;
+              reject(new Error("Error while loading the image"));
+            };
+          });
+        }
+        
+        function createClientSideGraphics() {
+            const graphicPromises = []
+            console.log(view.extent.spatialReference.isWebMercator || view.extent.spatialReference.isWGS84);
+  
+            for (let i = 1; i <= imageMax; i++) {
+              for(let j = 1; j <= imageMax; j++) {
+                const url = getIconUrl();
+                const graphicPromise = createGraphics(url, i, j);
+                graphicPromises.push(graphicPromise);
+              }
+            }
+
+            return promiseUtils.eachAlways(graphicPromises);
+        }
+
+      });
+    </script>
+  </head>
+
+  <body>
+    <h3><span id="myText"></span></h3>
+    <div id="viewDiv"></div>
+  </body>
+</html>
